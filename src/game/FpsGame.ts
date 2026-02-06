@@ -42,6 +42,7 @@ import {
 const TEAM_NAMES = ["counter", "terror"] as const;
 type TeamName = (typeof TEAM_NAMES)[number];
 const ALLOW_TEAM_DAMAGE = true;
+const INCOMING_DAMAGE_SCALE = 0.68;
 const REMOTE_WEAPON_WORLD_LONGEST: Record<WeaponId, number> = {
   assaultRifle: 0.62,
   shotgun: 0.66,
@@ -116,6 +117,8 @@ interface HudRefs {
   scoreboard: HTMLDivElement;
   roundTimer: HTMLSpanElement;
   toast: HTMLDivElement;
+  damageFlash: HTMLDivElement;
+  deathFade: HTMLDivElement;
   minimap: HTMLCanvasElement;
 }
 
@@ -215,6 +218,9 @@ export class FpsGame {
   private lastFootstepAt = 0;
   private viewKickback = 0;
   private viewRoll = 0;
+  private damageFlashAmount = 0;
+  private deathFadeAmount = 0;
+  private deathAnimProgress = 0;
   private spawnWave = 0;
   private respawnAt: number | null = null;
   private frameHandle = 0;
@@ -299,6 +305,8 @@ export class FpsGame {
 
           <canvas data-minimap width="220" height="220" class="minimap"></canvas>
           <div data-toast class="toast"></div>
+          <div data-damage-flash class="damage-flash" aria-hidden="true"></div>
+          <div data-death-fade class="death-fade" aria-hidden="true"></div>
           <div class="crosshair" aria-hidden="true"></div>
         </div>
       </div>
@@ -331,6 +339,8 @@ export class FpsGame {
     const scoreboard = this.root.querySelector<HTMLDivElement>("[data-scoreboard]");
     const roundTimer = this.root.querySelector<HTMLSpanElement>("[data-round]");
     const toast = this.root.querySelector<HTMLDivElement>("[data-toast]");
+    const damageFlash = this.root.querySelector<HTMLDivElement>("[data-damage-flash]");
+    const deathFade = this.root.querySelector<HTMLDivElement>("[data-death-fade]");
     const minimap = this.root.querySelector<HTMLCanvasElement>("[data-minimap]");
 
     if (
@@ -351,6 +361,8 @@ export class FpsGame {
       !scoreboard ||
       !roundTimer ||
       !toast ||
+      !damageFlash ||
+      !deathFade ||
       !minimap
     ) {
       throw new Error("HUD initialization failed");
@@ -374,6 +386,8 @@ export class FpsGame {
       scoreboard,
       roundTimer,
       toast,
+      damageFlash,
+      deathFade,
       minimap,
     };
 
@@ -1090,6 +1104,9 @@ export class FpsGame {
     this.localAlive = true;
     this.localKills = 0;
     this.localDeaths = 0;
+    this.damageFlashAmount = 0;
+    this.deathFadeAmount = 0;
+    this.deathAnimProgress = 0;
 
     this.hud.lobby.classList.remove("active");
     this.setStatus(`Connected as ${this.localPlayerName}. Match ${this.matchCode}.`);
@@ -1523,18 +1540,27 @@ export class FpsGame {
       return;
     }
 
+    const scaledDamage = Math.max(1, Math.round(event.damage * INCOMING_DAMAGE_SCALE));
     const spec = WEAPONS[event.weaponId];
     const result = applyDamage(
       {
         health: this.localHealth,
         armor: this.localArmor,
       },
-      event.damage,
+      scaledDamage,
       spec.armorPenetration,
     );
 
     this.localHealth = result.health;
     this.localArmor = result.armor;
+    const hitStrength = clamp(result.damageApplied / 42, 0.22, 1);
+    this.damageFlashAmount = Math.min(1, Math.max(this.damageFlashAmount, hitStrength));
+    this.viewKickback = Math.min(0.2, this.viewKickback + 0.018 + hitStrength * 0.045);
+    this.viewRoll = clamp(
+      this.viewRoll + (Math.random() - 0.5) * (0.045 + hitStrength * 0.04),
+      -0.2,
+      0.2,
+    );
 
     this.audio.playHit(event.headshot);
 
@@ -1557,6 +1583,9 @@ export class FpsGame {
     this.input.firing = false;
     this.respawnAt = Date.now() + 4200;
     this.localDeaths += 1;
+    this.deathAnimProgress = 0;
+    this.deathFadeAmount = Math.max(this.deathFadeAmount, 0.45);
+    this.damageFlashAmount = 1;
 
     this.audio.playDeath();
     this.showToast(`Eliminated by ${attackerName || "Unknown"}. Respawn in 4s.`);
@@ -1590,6 +1619,7 @@ export class FpsGame {
     this.updateLocalState(dt, now);
     this.updateRemotePlayers(dt);
     this.updateWeaponViewmodel(dt, now);
+    this.updateCombatFeedback(dt, now);
     this.updateShotTracers(dt);
     this.publishPresence(now);
     this.updateHudValues();
@@ -1605,6 +1635,7 @@ export class FpsGame {
     }
 
     if (!this.localAlive) {
+      this.updateDeathAnimation(dt);
       if (this.respawnAt !== null && now >= this.respawnAt) {
         this.respawnAt = null;
         this.respawnLocalPlayer();
@@ -1631,6 +1662,7 @@ export class FpsGame {
     );
     this.camera.rotation.y = this.playerBody.yaw;
     this.camera.rotation.x = this.playerBody.pitch;
+    this.camera.rotation.z = 0;
 
     this.tryAutomaticFire(now);
     this.maybePlayFootsteps(now);
@@ -1688,6 +1720,38 @@ export class FpsGame {
         dt * 28,
       );
     }
+  }
+
+  private updateCombatFeedback(dt: number, now: number): void {
+    this.damageFlashAmount = Math.max(0, this.damageFlashAmount - dt * 1.9);
+    if (this.localAlive) {
+      this.deathFadeAmount = Math.max(0, this.deathFadeAmount - dt * 1.8);
+    }
+
+    const lowHealth = clamp((44 - this.localHealth) / 44, 0, 1);
+    const pulse = lowHealth > 0 ? 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(now * 0.012)) : 0;
+    const composite = Math.max(this.damageFlashAmount, lowHealth * 0.22 * pulse);
+
+    this.hud.damageFlash.style.opacity = composite.toFixed(3);
+    this.hud.deathFade.style.opacity = this.deathFadeAmount.toFixed(3);
+  }
+
+  private updateDeathAnimation(dt: number): void {
+    this.deathAnimProgress = Math.min(1, this.deathAnimProgress + dt * 1.45);
+    const eased =
+      this.deathAnimProgress * this.deathAnimProgress * (3 - 2 * this.deathAnimProgress);
+
+    const eyeHeight = PLAYER_HEIGHT_STANDING - 0.14;
+    this.camera.position.set(
+      this.playerBody.position.x,
+      this.playerBody.position.y + eyeHeight - eased * 0.55,
+      this.playerBody.position.z,
+    );
+    this.camera.rotation.y = this.playerBody.yaw;
+    this.camera.rotation.x = clamp(this.playerBody.pitch + eased * 0.46, -1.25, 1.45);
+    this.camera.rotation.z = -eased * 0.34;
+
+    this.deathFadeAmount = Math.min(1, this.deathFadeAmount + dt * 0.58);
   }
 
   private updateRoundTimer(now: number): void {
@@ -2107,6 +2171,9 @@ export class FpsGame {
     this.localHealth = 100;
     this.localArmor = 100;
     this.localAlive = true;
+    this.damageFlashAmount = 0;
+    this.deathFadeAmount = 0;
+    this.deathAnimProgress = 0;
     this.playerBody.position = { ...spawn };
     this.playerBody.velocity = { x: 0, y: 0, z: 0 };
     this.playerBody.crouching = false;
@@ -2219,7 +2286,7 @@ export class FpsGame {
     ctx.fill();
 
     const facing = {
-      x: me.x + Math.sin(this.playerBody.yaw) * 12,
+      x: me.x - Math.sin(this.playerBody.yaw) * 12,
       y: me.y - Math.cos(this.playerBody.yaw) * 12,
     };
 
@@ -2230,14 +2297,6 @@ export class FpsGame {
     ctx.lineTo(facing.x, facing.y);
     ctx.stroke();
 
-    for (const remote of this.remotePlayers.values()) {
-      const marker = worldToMap(remote.group.position.x, remote.group.position.z, width, height);
-
-      ctx.fillStyle = remote.team === this.localTeam ? "#32a7ff" : "#ff7842";
-      ctx.beginPath();
-      ctx.arc(marker.x, marker.y, 4, 0, Math.PI * 2);
-      ctx.fill();
-    }
   }
 
   private setStatus(message: string): void {
