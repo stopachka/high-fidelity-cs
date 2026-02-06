@@ -6,14 +6,19 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "devDependencies": {
+    "@types/three": "^0.182.0",
     "typescript": "~5.9.3",
-    "vite": "^7.1.2"
+    "vite": "^7.1.2",
+    "vitest": "^4.0.18"
   },
   "dependencies": {
+    "@instantdb/admin": "latest",
     "@instantdb/core": "latest",
-    "@instantdb/admin": "latest"
+    "three": "^0.182.0"
   }
 }
